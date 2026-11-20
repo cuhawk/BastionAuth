@@ -19,15 +19,17 @@ type entry struct {
 }
 
 type Memory struct {
-	mu          sync.Mutex
-	grants      map[grantKey]grant
-	credentials map[credentialKey]entry
-	proofs      map[proofKey]time.Time
-	nextSweep   time.Time
+	mu           sync.Mutex
+	grants       map[grantKey]grant
+	credentials  map[credentialKey]entry
+	proofs       map[proofKey]time.Time
+	nextSweep    time.Time
+	pushed       map[credentialKey]PushedRequest
+	nextPARSweep time.Time
 }
 
 func NewMemory() *Memory {
-	return &Memory{grants: make(map[grantKey]grant), credentials: make(map[credentialKey]entry), proofs: make(map[proofKey]time.Time)}
+	return &Memory{pushed: make(map[credentialKey]PushedRequest), grants: make(map[grantKey]grant), credentials: make(map[credentialKey]entry), proofs: make(map[proofKey]time.Time)}
 }
 
 func (m *Memory) Consent(ctx context.Context, tenant, digest string, c Credential) error {

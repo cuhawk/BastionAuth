@@ -30,6 +30,8 @@ type Client struct {
 type Server struct {
 	Tenant, Origin, Audience string
 	Clients                  map[string]Client
+	CIMD                     *CIMDResolver
+	CIMDScopes               []string
 	Store                    store.Store
 	Sessions                 exchange.Verifier
 	DPoP                     dpop.Verifier
@@ -38,8 +40,10 @@ type Server struct {
 
 func (s Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.metadata)
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
 	mux.HandleFunc("POST /oauth/authorize", s.authorize)
+	mux.HandleFunc("POST /oauth/par", s.pushAuthorization)
 	mux.HandleFunc("POST /oauth/token", s.token)
 	mux.HandleFunc("POST /oauth/grant/revoke", s.revoke)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +52,21 @@ func (s Server) Handler() http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		mux.ServeHTTP(w, r)
+	})
+}
+
+func (s Server) metadata(w http.ResponseWriter, _ *http.Request) {
+	respond(w, http.StatusOK, map[string]any{
+		"issuer":                                s.Exchange.Issuer.Name,
+		"authorization_endpoint":                s.Origin + "/oauth/authorize",
+		"token_endpoint":                        s.Origin + "/oauth/token",
+		"jwks_uri":                              s.Origin + "/.well-known/jwks.json",
+		"pushed_authorization_request_endpoint": s.Origin + "/oauth/par",
+		"client_id_metadata_document_supported": s.CIMD != nil,
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token", exchange.GrantType},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_basic"},
 	})
 }
 
@@ -96,7 +115,7 @@ func (s Server) session(r *http.Request) (user, token string, err error) {
 	return c.Subject, cookie.Value, err
 }
 
-var authorizationFields = []string{"client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "scope", "state", "dpop_jkt"}
+var authorizationFields = []string{"client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "scope", "state", "dpop_jkt", "authorization_details"}
 
 func consentBinding(session string, values url.Values) string {
 	fields := url.Values{}
@@ -109,41 +128,102 @@ func consentBinding(session string, values url.Values) string {
 }
 
 var consentPage = template.Must(template.New("consent").Parse(`<!doctype html><html lang="en"><meta charset="utf-8"><title>Authorize application</title>
-<h1>Authorize {{.Client}}</h1><p>Requested permissions: {{.Scope}}</p>
+<h1>Authorize {{.Client}}</h1><p>Requested permissions: {{.Scope}}</p>{{if .Details}}<h2>Authorization details</h2><pre>{{.Details}}</pre>{{end}}
 <form action="/oauth/authorize" method="post">{{range $key,$value := .Fields}}<input type="hidden" name="{{$key}}" value="{{$value}}">{{end}}
 <button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form></html>`))
 
+func validDigest(raw string) bool {
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(raw)
+	return len(raw) == 43 && err == nil && len(decoded) == 32
+}
+
+func validateAuthorization(p url.Values, client Client) ([]string, exchange.Details, string) {
+	state := p.Get("state")
+	if p.Get("response_type") != "code" || p.Get("code_challenge_method") != "S256" ||
+		!validDigest(p.Get("code_challenge")) || state == "" || len(state) > 1024 ||
+		(p.Get("dpop_jkt") != "" && !validDigest(p.Get("dpop_jkt"))) {
+		return nil, nil, "invalid_request"
+	}
+	if !slices.Contains(client.Redirects, p.Get("redirect_uri")) {
+		return nil, nil, "invalid_request"
+	}
+	var details exchange.Details
+	if raw := p.Get("authorization_details"); p.Has("authorization_details") {
+		var err error
+		details, err = exchange.ParseDetails(raw)
+		if err != nil {
+			return nil, nil, exchange.ErrDetails.Error()
+		}
+	}
+	var scopes []string
+	if p.Get("scope") != "" || details == nil {
+		var err error
+		scopes, err = exchange.Scopes(p.Get("scope"))
+		if err != nil || !allowed(scopes, client.Scopes) {
+			return nil, nil, "invalid_scope"
+		}
+	}
+	return scopes, details, ""
+}
+
 func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 	p, ok := parameters(w, r)
-	client, registered := s.Clients[p.Get("client_id")]
-	challenge, err := base64.RawURLEncoding.Strict().DecodeString(p.Get("code_challenge"))
-	state := p.Get("state")
-	if !ok || !registered || !slices.Contains(client.Redirects, p.Get("redirect_uri")) || p.Get("response_type") != "code" || p.Get("code_challenge_method") != "S256" || err != nil || len(challenge) != 32 || len(p.Get("code_challenge")) != 43 || state == "" || len(state) > 1024 {
+	if !ok || p.Has("request") {
 		failure(w, 400, "invalid_request")
 		return
 	}
-	scopes, err := exchange.Scopes(p.Get("scope"))
-	if err != nil || !allowed(scopes, client.Scopes) {
-		failure(w, 400, "invalid_scope")
+	var user, session string
+	if p.Has("request_uri") {
+		var status int
+		var code string
+		p, user, session, status, code = s.takeAuthorization(r, p)
+		if code != "" {
+			failure(w, status, code)
+			return
+		}
+	}
+	client, name, ok := s.resolveClient(r.Context(), p.Get("client_id"))
+	if !ok {
+		failure(w, 400, "invalid_request")
 		return
 	}
-	user, session, err := s.session(r)
-	if err != nil {
-		failure(w, 401, "login_required")
+	scopes, details, code := validateAuthorization(p, client)
+	if code != "" {
+		failure(w, 400, code)
 		return
+	}
+	if session == "" {
+		var err error
+		user, session, err = s.session(r)
+		if err != nil {
+			failure(w, 401, "login_required")
+			return
+		}
+	}
+	var encodedDetails string
+	if details != nil {
+		encoded, err := json.Marshal(details)
+		if err != nil {
+			failure(w, 500, "server_error")
+			return
+		}
+		encodedDetails = string(encoded)
+		p.Set("authorization_details", encodedDetails)
 	}
 	if r.Method == http.MethodGet {
 		fields := make(map[string]string)
 		for _, key := range authorizationFields {
-			fields[key] = p.Get(key)
+			if p.Has(key) {
+				fields[key] = p.Get(key)
+			}
 		}
 		fields["consent_binding"] = consentBinding(session, p)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		_ = consentPage.Execute(w, struct {
-			Client, Scope string
-			Fields        map[string]string
-		}{p.Get("client_id"), p.Get("scope"), fields})
+			Client, Scope, Details string
+			Fields                 map[string]string
+		}{name, p.Get("scope"), encodedDetails, fields})
 		return
 	}
 	if r.Header.Get("Origin") != s.Origin || !equal(p.Get("consent_binding"), consentBinding(session, p)) || (p.Get("decision") != "approve" && p.Get("decision") != "deny") {
@@ -156,19 +236,12 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := redirect.Query()
-	q.Set("state", state)
+	q.Set("state", p.Get("state"))
 	if p.Get("decision") == "deny" {
 		q.Set("error", "access_denied")
 	} else {
 		code := store.Secret()
-		c := store.Credential{User: user, Client: p.Get("client_id"), Kind: "authorization_code", Redirect: p.Get("redirect_uri"), Challenge: p.Get("code_challenge"), Scope: strings.Join(scopes, " "), JKT: p.Get("dpop_jkt"), Expires: time.Now().Add(2 * time.Minute)}
-		if c.JKT != "" {
-			digest, err := base64.RawURLEncoding.Strict().DecodeString(c.JKT)
-			if err != nil || len(digest) != 32 {
-				failure(w, 400, "invalid_request")
-				return
-			}
-		}
+		c := store.Credential{User: user, Client: p.Get("client_id"), Kind: "authorization_code", Redirect: p.Get("redirect_uri"), Challenge: p.Get("code_challenge"), Scope: strings.Join(scopes, " "), AuthorizationDetails: encodedDetails, JKT: p.Get("dpop_jkt"), Expires: time.Now().Add(2 * time.Minute)}
 		if err := s.Store.Consent(r.Context(), s.Tenant, store.Digest(code), c); err != nil {
 			failure(w, 500, "server_error")
 			return
@@ -188,27 +261,30 @@ func allowed(requested, granted []string) bool {
 	return true
 }
 
-func (s Server) authenticate(r *http.Request, p url.Values) (string, bool) {
+func (s Server) authenticate(r *http.Request, p url.Values) (string, Client, bool) {
 	if len(r.Header.Values("Authorization")) > 1 {
-		return "", false
+		return "", Client{}, false
 	}
 	name, secret, basic := r.BasicAuth()
 	if basic {
 		var err error
 		name, err = url.QueryUnescape(name)
 		if err != nil {
-			return "", false
+			return "", Client{}, false
 		}
 		secret, err = url.QueryUnescape(secret)
 		if err != nil {
-			return "", false
+			return "", Client{}, false
 		}
 		c, ok := s.Clients[name]
-		return name, ok && c.SecretDigest != "" && !p.Has("client_secret") && !p.Has("client_id") && equal(store.Digest(secret), c.SecretDigest)
+		return name, c, ok && c.SecretDigest != "" && !p.Has("client_secret") && !p.Has("client_id") && equal(store.Digest(secret), c.SecretDigest)
 	}
 	name = p.Get("client_id")
-	c, ok := s.Clients[name]
-	return name, ok && c.SecretDigest == "" && len(r.Header.Values("Authorization")) == 0 && !p.Has("client_secret")
+	if len(r.Header.Values("Authorization")) != 0 || p.Has("client_secret") {
+		return "", Client{}, false
+	}
+	c, _, ok := s.resolveClient(r.Context(), name)
+	return name, c, ok && c.SecretDigest == ""
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 
@@ -218,7 +294,7 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "invalid_request")
 		return
 	}
-	client, authenticated := s.authenticate(r, p)
+	client, metadata, authenticated := s.authenticate(r, p)
 	if !authenticated {
 		w.Header().Set("WWW-Authenticate", `Basic realm="token"`)
 		failure(w, 401, "invalid_client")
@@ -227,6 +303,14 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 	grant := p.Get("grant_type")
 	if grant != "authorization_code" && grant != "refresh_token" && grant != exchange.GrantType {
 		failure(w, 400, "unsupported_grant_type")
+		return
+	}
+	if grant != exchange.GrantType && p.Has("authorization_details") {
+		failure(w, 400, exchange.ErrDetails.Error())
+		return
+	}
+	if _, registered := s.Clients[client]; grant == "authorization_code" && !registered && !slices.Contains(metadata.Redirects, p.Get("redirect_uri")) {
+		failure(w, 400, "invalid_grant")
 		return
 	}
 	if len(r.Header.Values("DPoP")) != 1 {
@@ -256,6 +340,7 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 	}
 	refresh := store.Secret()
 	var access, scope string
+	var details exchange.Details
 	const lifetime = 5 * time.Minute
 	err = s.Store.Rotate(r.Context(), s.Tenant, store.Digest(old), store.Digest(refresh), func(c store.Credential) (store.Credential, error) {
 		if c.Client != client || c.Kind != grant || !time.Now().Before(c.Expires) || (c.JKT != "" && !equal(c.JKT, jkt)) {
@@ -279,7 +364,13 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 		c.JKT = jkt
 		scope = c.Scope
 		var err error
-		access, err = s.Exchange.Issuer.Mint(s.Tenant, c.User, s.Audience, c.Scope, jkt, nil, time.Now().Add(lifetime))
+		if c.AuthorizationDetails != "" {
+			details, err = exchange.ParseDetails(c.AuthorizationDetails)
+			if err != nil {
+				return c, err
+			}
+		}
+		access, err = s.Exchange.Issuer.MintWithDetails(s.Tenant, c.User, s.Audience, c.Scope, jkt, nil, time.Now().Add(lifetime), details)
 		return c, err
 	})
 	switch {
@@ -290,7 +381,7 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		failure(w, 500, "server_error")
 	default:
-		respond(w, 200, map[string]any{"access_token": access, "token_type": "DPoP", "refresh_token": refresh, "expires_in": int(lifetime.Seconds()), "scope": scope})
+		tokenResponse(w, details, map[string]any{"access_token": access, "token_type": "DPoP", "refresh_token": refresh, "expires_in": int(lifetime.Seconds()), "scope": scope})
 	}
 }
 
@@ -303,17 +394,35 @@ func (s Server) exchange(w http.ResponseWriter, r *http.Request, p url.Values, c
 		failure(w, 400, "invalid_request")
 		return
 	}
-	result, err := s.Exchange.Exchange(r.Context(), s.Tenant, client, p.Get("subject_token"), p.Get("actor_token"), p.Get("audience"), p.Get("scope"), jkt)
+	var details exchange.Details
+	if p.Has("authorization_details") {
+		var err error
+		details, err = exchange.ParseDetails(p.Get("authorization_details"))
+		if err != nil {
+			failure(w, 400, exchange.ErrDetails.Error())
+			return
+		}
+	}
+	result, err := s.Exchange.ExchangeWithDetails(r.Context(), s.Tenant, client, p.Get("subject_token"), p.Get("actor_token"), p.Get("audience"), p.Get("scope"), jkt, details)
 	switch {
 	case errors.Is(err, exchange.ErrScope):
 		failure(w, 400, "invalid_scope")
+	case errors.Is(err, exchange.ErrDetails):
+		failure(w, 400, exchange.ErrDetails.Error())
 	case errors.Is(err, exchange.ErrDenied):
 		failure(w, 400, "access_denied")
 	case err != nil:
 		failure(w, 500, "server_error")
 	default:
-		respond(w, 200, map[string]any{"access_token": result.AccessToken, "issued_token_type": exchange.AccessType, "token_type": "DPoP", "expires_in": max(0, int(time.Until(result.ExpiresAt).Seconds())), "scope": result.Scope})
+		tokenResponse(w, result.AuthorizationDetails, map[string]any{"access_token": result.AccessToken, "issued_token_type": exchange.AccessType, "token_type": "DPoP", "expires_in": max(0, int(time.Until(result.ExpiresAt).Seconds())), "scope": result.Scope})
 	}
+}
+
+func tokenResponse(w http.ResponseWriter, details exchange.Details, fields map[string]any) {
+	if len(details) > 0 {
+		fields["authorization_details"] = details
+	}
+	respond(w, http.StatusOK, fields)
 }
 
 func validVerifier(v string) bool {
@@ -334,8 +443,9 @@ func (s Server) RevokeGrant(ctx context.Context, userID, clientID string) error 
 
 func (s Server) revoke(w http.ResponseWriter, r *http.Request) {
 	p, ok := parameters(w, r)
-	_, registered := s.Clients[p.Get("client_id")]
-	if !ok || !registered || r.Header.Get("Origin") != s.Origin {
+	id := p.Get("client_id")
+	_, registered := s.Clients[id]
+	if !ok || (!registered && (s.CIMD == nil || !metadataURL(id))) || r.Header.Get("Origin") != s.Origin {
 		failure(w, 400, "invalid_request")
 		return
 	}

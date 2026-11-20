@@ -33,11 +33,12 @@ type Confirmation struct {
 }
 type Claims struct {
 	jwt.Claims
-	Tenant string        `json:"tenant_id"`
-	Scope  string        `json:"scope"`
-	Act    *Actor        `json:"act,omitempty"`
-	MayAct *Actor        `json:"may_act,omitempty"`
-	CNF    *Confirmation `json:"cnf,omitempty"`
+	AuthorizationDetails Details       `json:"authorization_details,omitempty"`
+	Tenant               string        `json:"tenant_id"`
+	Scope                string        `json:"scope"`
+	Act                  *Actor        `json:"act,omitempty"`
+	MayAct               *Actor        `json:"may_act,omitempty"`
+	CNF                  *Confirmation `json:"cnf,omitempty"`
 }
 
 type JWKS struct {
@@ -144,7 +145,11 @@ type Issuer struct {
 }
 
 func (i Issuer) Mint(tenant, subject, audience, scope, jkt string, act *Actor, expiry time.Time) (string, error) {
-	c := Claims{Claims: jwt.Claims{Issuer: i.Name, Subject: subject, Audience: jwt.Audience{audience}, IssuedAt: jwt.NewNumericDate(time.Now()), Expiry: jwt.NewNumericDate(expiry), ID: store.Secret()}, Tenant: tenant, Scope: scope, Act: act}
+	return i.MintWithDetails(tenant, subject, audience, scope, jkt, act, expiry, nil)
+}
+
+func (i Issuer) MintWithDetails(tenant, subject, audience, scope, jkt string, act *Actor, expiry time.Time, details Details) (string, error) {
+	c := Claims{AuthorizationDetails: details, Claims: jwt.Claims{Issuer: i.Name, Subject: subject, Audience: jwt.Audience{audience}, IssuedAt: jwt.NewNumericDate(time.Now()), Expiry: jwt.NewNumericDate(expiry), ID: store.Secret()}, Tenant: tenant, Scope: scope, Act: act}
 	if jkt != "" {
 		c.CNF = &Confirmation{JKT: jkt}
 	}
@@ -158,12 +163,17 @@ type Service struct {
 }
 
 type Result struct {
-	AccessToken string
-	Scope       string
-	ExpiresAt   time.Time
+	AuthorizationDetails Details
+	AccessToken          string
+	Scope                string
+	ExpiresAt            time.Time
 }
 
 func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, actorToken, audience, requested, jkt string) (Result, error) {
+	return s.ExchangeWithDetails(ctx, tenant, client, subjectToken, actorToken, audience, requested, jkt, nil)
+}
+
+func (s Service) ExchangeWithDetails(ctx context.Context, tenant, client, subjectToken, actorToken, audience, requested, jkt string, details Details) (Result, error) {
 	subject, err := s.Verifier.Verify(ctx, subjectToken, tenant)
 	if err != nil {
 		return Result{}, ErrDenied
@@ -181,11 +191,18 @@ func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, act
 	if !ok || audience == "" || jkt == "" {
 		return Result{}, ErrDenied
 	}
-	subjectScopes, err := Scopes(subject.Scope)
+	if details == nil {
+		details = subject.AuthorizationDetails
+	}
+	if !permitsDetails(subject.AuthorizationDetails, details) ||
+		(len(actor.AuthorizationDetails) > 0 && (len(details) == 0 || !permitsDetails(actor.AuthorizationDetails, details))) {
+		return Result{}, ErrDetails
+	}
+	subjectScopes, err := claimScopes(subject)
 	if err != nil {
 		return Result{}, err
 	}
-	actorScopes, err := Scopes(actor.Scope)
+	actorScopes, err := claimScopes(actor)
 	if err != nil {
 		return Result{}, err
 	}
@@ -204,7 +221,7 @@ func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, act
 			return Result{}, ErrScope
 		}
 	}
-	if len(scopes) == 0 {
+	if len(scopes) == 0 && (len(details) == 0 || len(actor.AuthorizationDetails) == 0 || subject.Scope != "" || requested != "") {
 		return Result{}, ErrScope
 	}
 	depth := 0
@@ -222,11 +239,18 @@ func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, act
 	}
 	act := &Actor{Subject: actor.Subject, Issuer: actor.Issuer, Act: subject.Act}
 	scope := strings.Join(scopes, " ")
-	access, err := s.Issuer.Mint(tenant, subject.Subject, audience, scope, jkt, act, expiry)
+	access, err := s.Issuer.MintWithDetails(tenant, subject.Subject, audience, scope, jkt, act, expiry, details)
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{AccessToken: access, Scope: scope, ExpiresAt: expiry.Truncate(time.Second)}, nil
+	return Result{AuthorizationDetails: details, AccessToken: access, Scope: scope, ExpiresAt: expiry.Truncate(time.Second)}, nil
+}
+
+func claimScopes(claims Claims) ([]string, error) {
+	if claims.Scope == "" && len(claims.AuthorizationDetails) > 0 {
+		return nil, nil
+	}
+	return Scopes(claims.Scope)
 }
 
 func Scopes(raw string) ([]string, error) {

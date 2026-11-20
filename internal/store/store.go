@@ -13,10 +13,13 @@ var ErrInvalid = errors.New("invalid grant")
 
 type Credential struct {
 	User, Client, Kind, Redirect, Challenge, Scope, JKT string
+	AuthorizationDetails                                string `json:",omitempty"`
 	Expires                                             time.Time
 }
 
 type Store interface {
+	SavePushedRequest(context.Context, string, string, PushedRequest) error
+	TakePushedRequest(context.Context, string, string, string) (string, error)
 	Consent(context.Context, string, string, Credential) error
 	Revoke(context.Context, string, string, string) error
 	Rotate(context.Context, string, string, string, func(Credential) (Credential, error)) error

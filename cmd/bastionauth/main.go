@@ -31,6 +31,7 @@ type config struct {
 	Tenant, Origin, Audience, Issuer, KeyID, SigningKeyFile, Listen string
 	Clients                                                         map[string]oauth.Client
 	Targets                                                         map[string][]string
+	CIMDScopes                                                      []string
 	Sessions, Exchange                                              trust
 }
 
@@ -109,6 +110,10 @@ func run() error {
 	}
 	db := store.Postgres{Pool: pool}
 	s := oauth.Server{Tenant: cfg.Tenant, Origin: cfg.Origin, Audience: cfg.Audience, Clients: cfg.Clients, Store: db, Sessions: cfg.Sessions.verifier(), DPoP: dpop.Verifier{Store: db}, Exchange: exchange.Service{Verifier: cfg.Exchange.verifier(), Issuer: exchange.Issuer{Name: cfg.Issuer, Signer: signer}, Targets: cfg.Targets}}
+	if cfg.CIMDScopes != nil {
+		s.CIMD = oauth.NewCIMDResolver()
+		s.CIMDScopes = cfg.CIMDScopes
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/", s.Handler())
 	mux.HandleFunc("GET /.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
@@ -140,8 +145,13 @@ func httpsURL(raw string) (*url.URL, bool) {
 }
 
 func (c config) validate() error {
+	for _, scope := range c.CIMDScopes {
+		if parsed, err := exchange.Scopes(scope); err != nil || len(parsed) != 1 || parsed[0] != scope {
+			return errors.New("invalid CIMD scope")
+		}
+	}
 	origin, ok := httpsURL(c.Origin)
-	if !ok || origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || c.Tenant == "" || c.Audience == "" || c.Issuer == "" || c.KeyID == "" || c.SigningKeyFile == "" || c.Listen == "" || len(c.Clients) == 0 {
+	if !ok || origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || c.Tenant == "" || c.Audience == "" || c.Issuer == "" || c.KeyID == "" || c.SigningKeyFile == "" || c.Listen == "" || (len(c.Clients) == 0 && c.CIMDScopes == nil) {
 		return errors.New("missing or invalid server configuration")
 	}
 	for _, t := range []trust{c.Sessions, c.Exchange} {

@@ -88,7 +88,14 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 	}
 	defer pool.Close()
 	p := store.Postgres{Pool: pool}
-	c := store.Credential{User: "user", Client: "client", Expires: time.Now().Add(time.Hour)}
+	t.Run("pushed requests", func(t *testing.T) {
+		checkPushedRequests(t, p)
+		var visible int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pushed_requests").Scan(&visible); err != nil || visible != 0 {
+			t.Fatalf("pushed requests visible without a tenant: %d %v", visible, err)
+		}
+	})
+	c := store.Credential{User: "user", Client: "client", AuthorizationDetails: `[{"type":"inventory","actions":["read"]}]`, Expires: time.Now().Add(time.Hour)}
 	if err := p.Consent(ctx, "alpha", "old", c); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +144,7 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 		t.Fatal("RLS accepted cross-tenant insert")
 	}
 	var forced int
-	if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace AND relrowsecurity AND relforcerowsecurity", namespace).Scan(&forced); err != nil || forced != 3 {
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace AND relrowsecurity AND relforcerowsecurity", namespace).Scan(&forced); err != nil || forced != 4 {
 		t.Fatalf("forced RLS tables: %d %v", forced, err)
 	}
 
@@ -173,7 +180,12 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := p.Rotate(ctx, "beta", "old", "fresh", func(c store.Credential) (store.Credential, error) { return c, nil }); err != nil {
+	if err := p.Rotate(ctx, "beta", "old", "fresh", func(stored store.Credential) (store.Credential, error) {
+		if stored.AuthorizationDetails != c.AuthorizationDetails {
+			return stored, errors.New("lost authorization details")
+		}
+		return stored, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM credentials").Scan(&visible); err != nil || visible != 0 {
