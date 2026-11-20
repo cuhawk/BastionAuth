@@ -24,6 +24,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test -race -v ./...
+      - run: go test -race -count=1 -v ./...
       - run: go run ./cmd/migrationlint ./migrations
       - run: go run ./benchmarks/run_bench.go -requests 500 -workers 8
