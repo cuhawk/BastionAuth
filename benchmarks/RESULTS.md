@@ -1,8 +1,8 @@
-- Requests/s: 7910.18
-- p50: 1.626797ms
-- p95: 4.093737ms
-- p99: 5.510971ms
-- Allocations/op: 764
-- Race-enabled tests passed: 6
-- Race-enabled subtests passed: 23
+- Requests/s: 4994.56
+- p50: 2.636873ms
+- p95: 6.185731ms
+- p99: 7.688078ms
+- Allocations/op: 766
+- Race-enabled tests passed: 7
+- Race-enabled subtests passed: 26
 - Data race reports: 0

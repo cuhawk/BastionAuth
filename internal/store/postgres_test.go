@@ -108,6 +108,23 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 	}); !errors.Is(err, rollback) {
 		t.Fatal(err)
 	}
+	// The transaction-local tenant identifier must round-trip as a literal.
+	const quotedTenant = "tenant'quoted"
+	if err := p.Consent(ctx, quotedTenant, "quoted-code", c); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.WithTenantTx(ctx, quotedTenant, func(tx pgx.Tx) error {
+		var tenant string
+		if err := tx.QueryRow(ctx, "SELECT tenant_id FROM grants").Scan(&tenant); err != nil {
+			return err
+		}
+		if tenant != quotedTenant {
+			return errors.New("quoted tenant did not round-trip")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var visible int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM grants").Scan(&visible); err != nil || visible != 0 {
 		t.Fatalf("tenant leaked after rollback: %d %v", visible, err)
@@ -180,8 +197,20 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 	if got := claimed.Load(); got != 1 {
 		t.Fatalf("accepted %d concurrent proofs", got)
 	}
-	ok, err := p.ClaimProof(ctx, "alpha", "jkt", "jti", now.Add(time.Minute), now.Add(2*time.Minute))
-	if err != nil || !ok {
-		t.Fatalf("expired replay was not evicted: %v %v", ok, err)
+	claimed.Store(0)
+	for range 24 {
+		wg.Go(func() {
+			ok, err := p.ClaimProof(ctx, "alpha", "jkt", "jti", now.Add(time.Minute), now.Add(2*time.Minute))
+			if err != nil {
+				t.Error(err)
+			}
+			if ok {
+				claimed.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if got := claimed.Load(); got != 1 {
+		t.Fatalf("accepted %d concurrent proofs after expiry", got)
 	}
 }

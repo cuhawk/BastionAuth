@@ -54,7 +54,10 @@ func (j *JWKS) key(ctx context.Context, kid, alg string) (any, error) {
 	defer j.mu.Unlock()
 	now := time.Now()
 	key, found := j.keys[kid]
-	if !now.Before(j.expires) || (!found && now.Sub(j.refreshed) >= time.Second) {
+	if !now.Before(j.expires) || !found {
+		if now.Sub(j.refreshed) < time.Second {
+			return nil, ErrDenied
+		}
 		j.refreshed = now
 		contextWithTimeout, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
@@ -108,7 +111,7 @@ type Verifier struct {
 
 func (v Verifier) Verify(ctx context.Context, raw, tenant string) (Claims, error) {
 	var c Claims
-	if len(raw) > 16384 {
+	if v.Keys == nil || len(raw) > 16384 || strings.Count(raw, ".") != 2 {
 		return c, ErrDenied
 	}
 	token, err := jwt.ParseSigned(raw, joseutil.Algorithms)
@@ -116,7 +119,7 @@ func (v Verifier) Verify(ctx context.Context, raw, tenant string) (Claims, error
 		return c, ErrDenied
 	}
 	h := token.Headers[0]
-	if h.KeyID == "" || len(h.KeyID) > 256 || h.ExtraHeaders[jose.HeaderType] != "at+jwt" {
+	if h.KeyID == "" || len(h.KeyID) > 256 || h.ExtraHeaders[jose.HeaderType] != "at+jwt" || h.JSONWebKey != nil {
 		return c, ErrDenied
 	}
 	key, err := v.Keys.key(ctx, h.KeyID, h.Algorithm)
@@ -166,7 +169,7 @@ func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, act
 		return Result{}, ErrDenied
 	}
 	actor, err := s.Verifier.Verify(ctx, actorToken, tenant)
-	if err != nil || actor.Subject != client || actor.Act != nil || subject.MayAct == nil || subject.MayAct.Subject != actor.Subject || (subject.MayAct.Issuer != "" && subject.MayAct.Issuer != actor.Issuer) {
+	if err != nil || actor.Subject != client || actor.Act != nil || subject.MayAct == nil || subject.MayAct.Act != nil || subject.MayAct.Subject != actor.Subject || (subject.MayAct.Issuer != "" && subject.MayAct.Issuer != actor.Issuer) {
 		return Result{}, ErrDenied
 	}
 	for _, c := range []Claims{subject, actor} {
@@ -175,20 +178,34 @@ func (s Service) Exchange(ctx context.Context, tenant, client, subjectToken, act
 		}
 	}
 	ceiling, ok := s.Targets[audience]
-	if !ok || audience == "" {
+	if !ok || audience == "" || jkt == "" {
 		return Result{}, ErrDenied
 	}
-	if requested == "" {
-		requested = subject.Scope
-	}
-	scopes, err := Scopes(requested)
+	subjectScopes, err := Scopes(subject.Scope)
 	if err != nil {
 		return Result{}, err
 	}
-	for _, scope := range scopes {
-		if !slices.Contains(strings.Split(subject.Scope, " "), scope) || !slices.Contains(strings.Split(actor.Scope, " "), scope) || !slices.Contains(ceiling, scope) {
+	actorScopes, err := Scopes(actor.Scope)
+	if err != nil {
+		return Result{}, err
+	}
+	candidates := subjectScopes
+	if requested != "" {
+		candidates, err = Scopes(requested)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	var scopes []string
+	for _, scope := range candidates {
+		if slices.Contains(subjectScopes, scope) && slices.Contains(actorScopes, scope) && slices.Contains(ceiling, scope) {
+			scopes = append(scopes, scope)
+		} else if requested != "" {
 			return Result{}, ErrScope
 		}
+	}
+	if len(scopes) == 0 {
+		return Result{}, ErrScope
 	}
 	depth := 0
 	for a := subject.Act; a != nil; a = a.Act {

@@ -25,7 +25,7 @@ flowchart LR
 | `POST /oauth/grant/revoke` | Accepts form-encoded `client_id` from the user’s session and same origin. Revokes all codes and refresh tokens for that client grant. |
 | `GET /.well-known/jwks.json` | Serves the active public Ed25519 signing key. |
 
-RFC 8693 requests use `urn:ietf:params:oauth:grant-type:token-exchange`, two access-token type identifiers (`urn:ietf:params:oauth:token-type:access_token`), and a configured `audience`. The client authenticates with its secret and presents an actor token naming that same client. The subject token must authorize that actor via `may_act`. Each requested scope must appear on both tokens and in the target policy. Unrecognized target, actor, or delegation fails with `access_denied`. Scope escalation fails with `invalid_scope`. An omitted `scope` requests the subject’s full scope and is still subject to the intersection. See the design RFC for the database and verification invariants. [RFC 001](rfcs/001-token-exchange-and-rls.md)
+RFC 8693 requests use `urn:ietf:params:oauth:grant-type:token-exchange`, two access-token type identifiers (`urn:ietf:params:oauth:token-type:access_token`), and a configured `audience`. The client authenticates with its secret and presents an actor token naming that same client. The subject token must authorize that actor via `may_act`. Each requested scope must appear on both tokens and in the target policy. Unrecognized target, actor, or delegation fails with `access_denied`. Scope escalation fails with `invalid_scope`. An omitted `scope` defaults to the intersection of the subject scopes, actor scopes, and target policy. See the design RFC for the database and verification invariants. [RFC 001](rfcs/001-token-exchange-and-rls.md)
 
 ## Run
 

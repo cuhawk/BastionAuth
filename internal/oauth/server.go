@@ -189,6 +189,9 @@ func allowed(requested, granted []string) bool {
 }
 
 func (s Server) authenticate(r *http.Request, p url.Values) (string, bool) {
+	if len(r.Header.Values("Authorization")) > 1 {
+		return "", false
+	}
 	name, secret, basic := r.BasicAuth()
 	if basic {
 		var err error

@@ -19,6 +19,7 @@ func TestMigrationLinter(t *testing.T) {
 		{"check got dropped", []string{timers + add + validate + "ALTER TABLE accounts DROP CONSTRAINT accounts_email_nn;" + promote}, false},
 		{"timeouts in comment", []string{"-- " + timers + "\nCREATE INDEX CONCURRENTLY i ON accounts(email);"}, false},
 		{"timeout disabled", []string{timers + "SET lock_timeout='0s'; CREATE TABLE test (i int);"}, false},
+		{"sub-millisecond timeout", []string{timers + "SET lock_timeout='1us'; CREATE TABLE test (i int);"}, false},
 		{"safe", []string{timers + add, timers + validate, timers + promote + "CREATE INDEX CONCURRENTLY email_idx ON accounts(email);"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -45,6 +45,17 @@ func TestRFC8693PrivilegeEscalationBlocked(t *testing.T) {
 			}
 		})
 	}
+	t.Run("omitted scope uses intersection", func(t *testing.T) {
+		result, err := service.Exchange(t.Context(), "tenant", "delegate", subject, actor, "inventory", "", "thumbprint")
+		if err != nil || result.Scope != "read" {
+			t.Fatalf("want read-only exchange, got %q, %v", result.Scope, err)
+		}
+	})
+	t.Run("missing sender binding", func(t *testing.T) {
+		if _, err := service.Exchange(t.Context(), "tenant", "delegate", subject, actor, "inventory", "read", ""); !errors.Is(err, exchange.ErrDenied) {
+			t.Fatalf("unbound exchange: %v", err)
+		}
+	})
 	result, err := service.Exchange(context.Background(), "tenant", "delegate", subject, actor, "inventory", "read", "thumbprint")
 	if err != nil {
 		t.Fatal(err)

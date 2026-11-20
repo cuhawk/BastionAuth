@@ -31,7 +31,7 @@ type claims struct {
 }
 
 func (v Verifier) Verify(ctx context.Context, tenant, proof, method, target, accessToken, binding string) (string, error) {
-	if len(proof) > 8192 {
+	if len(proof) > 8192 || strings.Count(proof, ".") != 2 {
 		return "", ErrProof
 	}
 	token, err := jwt.ParseSigned(proof, joseutil.Algorithms)
@@ -40,7 +40,7 @@ func (v Verifier) Verify(ctx context.Context, tenant, proof, method, target, acc
 	}
 	header := token.Headers[0]
 	key := header.JSONWebKey
-	if header.ExtraHeaders[jose.HeaderType] != "dpop+jwt" || key == nil || !key.Valid() || !key.IsPublic() || !joseutil.Matches(header.Algorithm, key.Key) {
+	if header.ExtraHeaders[jose.HeaderType] != "dpop+jwt" || key == nil || !key.Valid() || !key.IsPublic() || !joseutil.Matches(header.Algorithm, key.Key) || (key.Algorithm != "" && key.Algorithm != header.Algorithm) {
 		return "", ErrProof
 	}
 	var c claims

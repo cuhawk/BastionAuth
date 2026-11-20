@@ -26,8 +26,8 @@ func (p Postgres) WithTenantTx(ctx context.Context, tenant string, fn func(pgx.T
 		defer cancel()
 		_ = tx.Rollback(cleanup)
 	}()
-	// set_config with is_local=true implements SET LOCAL with a bound parameter.
-	if _, err = tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenant); err != nil {
+	// PostgreSQL SET requires a literal. Simple protocol safely quotes the argument.
+	if _, err = tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", pgx.QueryExecModeSimpleProtocol, tenant); err != nil {
 		return err
 	}
 	if err = fn(tx); err != nil {
@@ -109,10 +109,20 @@ func (p Postgres) Rotate(ctx context.Context, tenant, oldDigest, newDigest strin
 
 func (p Postgres) ClaimProof(ctx context.Context, tenant, key, jti string, now, expires time.Time) (claimed bool, err error) {
 	err = p.WithTenantTx(ctx, tenant, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `DELETE FROM dpop_replays WHERE tenant_id=$1 AND expires_at <= $2`, tenant, now); err != nil {
+		// Limit cleanup work and skip rows that concurrent claims already locked.
+		if _, err := tx.Exec(ctx, `DELETE FROM dpop_replays AS replay USING (
+			SELECT thumbprint, jti FROM dpop_replays
+			WHERE tenant_id=$1 AND expires_at <= $2
+			  AND (thumbprint, jti) <> ($3, $4)
+			ORDER BY expires_at LIMIT 128 FOR UPDATE SKIP LOCKED
+		) AS expired
+		WHERE replay.tenant_id=$1 AND replay.thumbprint=expired.thumbprint AND replay.jti=expired.jti`,
+			tenant, now, key, jti); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `INSERT INTO dpop_replays(tenant_id,thumbprint,jti,expires_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, tenant, key, jti, expires)
+		tag, err := tx.Exec(ctx, `INSERT INTO dpop_replays(tenant_id,thumbprint,jti,expires_at) VALUES($1,$2,$3,$4)
+			ON CONFLICT (tenant_id,thumbprint,jti) DO UPDATE SET expires_at=EXCLUDED.expires_at
+			WHERE dpop_replays.expires_at <= $5`, tenant, key, jti, expires, now)
 		claimed = tag.RowsAffected() == 1
 		return err
 	})

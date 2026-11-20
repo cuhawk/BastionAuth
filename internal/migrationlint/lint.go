@@ -9,7 +9,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-var positiveTimeout = regexp.MustCompile(`^\s*0*[1-9][0-9]*\s*(us|ms|s|min|h|d)?\s*$`)
+var positiveTimeout = regexp.MustCompile(`^\s*0*[1-9][0-9]*\s*(ms|s|min|h|d)?\s*$`)
 
 type checkKey struct{ schema, table, name string }
 type check struct {
