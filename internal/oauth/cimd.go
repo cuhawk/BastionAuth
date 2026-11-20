@@ -43,18 +43,19 @@ type CIMDResolver struct {
 }
 
 func NewCIMDResolver() *CIMDResolver {
-	return &CIMDResolver{
-		client: &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				DialContext:            dialMetadata,
-				MaxIdleConns:           32,
-				IdleConnTimeout:        30 * time.Second,
-				MaxResponseHeaderBytes: 64 << 10,
-			},
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	return &CIMDResolver{client: newPublicHTTPSClient(), cache: make(map[string]metadataEntry)}
+}
+
+func newPublicHTTPSClient() *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext:            dialMetadata,
+			MaxIdleConns:           32,
+			IdleConnTimeout:        30 * time.Second,
+			MaxResponseHeaderBytes: 64 << 10,
 		},
-		cache: make(map[string]metadataEntry),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }
 
