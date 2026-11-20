@@ -19,12 +19,17 @@ import (
 	"github.com/cuhawk/BastionAuth/internal/dpop"
 	"github.com/cuhawk/BastionAuth/internal/exchange"
 	"github.com/cuhawk/BastionAuth/internal/store"
+	"github.com/go-jose/go-jose/v4"
 )
 
 type Client struct {
-	Redirects    []string
-	Scopes       []string
-	SecretDigest string
+	Redirects     []string
+	Scopes        []string
+	SecretDigest  string
+	JWTKeys       []jose.JSONWebKey
+	PrivateKeyJWT bool
+	RequireJAR    bool
+	RequestURIs   []string
 }
 
 type Server struct {
@@ -36,9 +41,13 @@ type Server struct {
 	Sessions                 exchange.Verifier
 	DPoP                     dpop.Verifier
 	Exchange                 exchange.Service
+	requestObjects           *http.Client
 }
 
 func (s Server) Handler() http.Handler {
+	if s.requestObjects == nil {
+		s.requestObjects = newPublicHTTPSClient()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.metadata)
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
@@ -46,27 +55,33 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("POST /oauth/par", s.pushAuthorization)
 	mux.HandleFunc("POST /oauth/token", s.token)
 	mux.HandleFunc("POST /oauth/grant/revoke", s.revoke)
+	handler := instrument(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		mux.ServeHTTP(w, r)
+		handler.ServeHTTP(w, r)
 	})
 }
 
 func (s Server) metadata(w http.ResponseWriter, _ *http.Request) {
 	respond(w, http.StatusOK, map[string]any{
-		"issuer":                                s.Exchange.Issuer.Name,
-		"authorization_endpoint":                s.Origin + "/oauth/authorize",
-		"token_endpoint":                        s.Origin + "/oauth/token",
-		"jwks_uri":                              s.Origin + "/.well-known/jwks.json",
-		"pushed_authorization_request_endpoint": s.Origin + "/oauth/par",
-		"client_id_metadata_document_supported": s.CIMD != nil,
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token", exchange.GrantType},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_basic"},
+		"issuer":                                           s.Exchange.Issuer.Name,
+		"authorization_endpoint":                           s.Origin + "/oauth/authorize",
+		"token_endpoint":                                   s.Origin + "/oauth/token",
+		"jwks_uri":                                         s.Origin + "/.well-known/jwks.json",
+		"pushed_authorization_request_endpoint":            s.Origin + "/oauth/par",
+		"client_id_metadata_document_supported":            s.CIMD != nil,
+		"response_types_supported":                         []string{"code"},
+		"grant_types_supported":                            []string{"authorization_code", "refresh_token", exchange.GrantType},
+		"code_challenge_methods_supported":                 []string{"S256"},
+		"token_endpoint_auth_methods_supported":            []string{"none", "client_secret_basic", "private_key_jwt"},
+		"request_parameter_supported":                      true,
+		"request_uri_parameter_supported":                  true,
+		"require_request_uri_registration":                 true,
+		"request_object_signing_alg_values_supported":      signedAlgorithms,
+		"token_endpoint_auth_signing_alg_values_supported": signedAlgorithms,
 	})
 }
 
@@ -122,6 +137,9 @@ func consentBinding(session string, values url.Values) string {
 	for _, field := range authorizationFields {
 		fields.Set(field, values.Get(field))
 	}
+	if values.Has("signed_consent") {
+		fields.Set("signed_consent", values.Get("signed_consent"))
+	}
 	mac := hmac.New(sha256.New, []byte(session))
 	mac.Write([]byte("bastionauth-consent-v1:" + fields.Encode()))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -168,12 +186,22 @@ func validateAuthorization(p url.Values, client Client) ([]string, exchange.Deta
 
 func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 	p, ok := parameters(w, r)
-	if !ok || p.Has("request") {
+	if !ok {
 		failure(w, 400, "invalid_request")
 		return
 	}
 	var user, session string
-	if p.Has("request_uri") {
+	var identity signedIdentity
+	var signedConsent bool
+	switch {
+	case p.Has("request") || (p.Has("request_uri") && !strings.HasPrefix(p.Get("request_uri"), pushedRequestPrefix)):
+		var code string
+		p, identity, code = s.frontChannelJAR(r, p)
+		if code != "" {
+			failure(w, 400, code)
+			return
+		}
+	case p.Has("request_uri"):
 		var status int
 		var code string
 		p, user, session, status, code = s.takeAuthorization(r, p)
@@ -181,10 +209,16 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 			failure(w, status, code)
 			return
 		}
+		signedConsent = p.Has(pushedSignedMarker)
+		p.Del(pushedSignedMarker)
 	}
 	client, name, ok := s.resolveClient(r.Context(), p.Get("client_id"))
 	if !ok {
 		failure(w, 400, "invalid_request")
+		return
+	}
+	if client.RequireJAR && r.Method == http.MethodGet && identity.id == "" && !signedConsent {
+		failure(w, 400, "invalid_request_object")
 		return
 	}
 	scopes, details, code := validateAuthorization(p, client)
@@ -197,6 +231,12 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 		user, session, err = s.session(r)
 		if err != nil {
 			failure(w, 401, "login_required")
+			return
+		}
+	}
+	if identity.id != "" {
+		if status, code := s.claimRequestObject(r.Context(), identity); code != "" {
+			failure(w, status, code)
 			return
 		}
 	}
@@ -217,6 +257,21 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 				fields[key] = p.Get(key)
 			}
 		}
+		if signedConsent || identity.id != "" {
+			nonce := store.Secret()
+			p.Set("signed_consent", nonce)
+			binding := consentBinding(session, p)
+			err := s.Store.SavePushedRequest(r.Context(), s.Tenant, signedConsentDigest(nonce, binding), store.PushedRequest{
+				Client: p.Get("client_id"), Expires: time.Now().Add(maxSignedJWT),
+			})
+			if err != nil {
+				failure(w, 500, "server_error")
+				return
+			}
+			fields["signed_consent"] = nonce
+		} else {
+			p.Del("signed_consent")
+		}
 		fields["consent_binding"] = consentBinding(session, p)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
@@ -229,6 +284,22 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Origin") != s.Origin || !equal(p.Get("consent_binding"), consentBinding(session, p)) || (p.Get("decision") != "approve" && p.Get("decision") != "deny") {
 		failure(w, 400, "invalid_request")
 		return
+	}
+	if client.RequireJAR || p.Has("signed_consent") {
+		nonce := p.Get("signed_consent")
+		if !validDigest(nonce) {
+			failure(w, 400, "invalid_request")
+			return
+		}
+		_, err := s.Store.TakePushedRequest(r.Context(), s.Tenant, p.Get("client_id"), signedConsentDigest(nonce, p.Get("consent_binding")))
+		if errors.Is(err, store.ErrInvalid) {
+			failure(w, 400, "invalid_request")
+			return
+		}
+		if err != nil {
+			failure(w, 500, "server_error")
+			return
+		}
 	}
 	redirect, err := url.Parse(p.Get("redirect_uri"))
 	if err != nil {
@@ -261,7 +332,28 @@ func allowed(requested, granted []string) bool {
 	return true
 }
 
-func (s Server) authenticate(r *http.Request, p url.Values) (string, Client, bool) {
+func (s Server) authenticate(w http.ResponseWriter, r *http.Request, p url.Values, realm string) (string, Client, bool) {
+	if p.Has("client_assertion") || p.Has("client_assertion_type") {
+		id, client, err := s.assertionClient(r, p)
+		switch {
+		case err == nil:
+			return id, client, true
+		case errors.Is(err, errSignedJWT):
+			failure(w, 401, "invalid_client")
+		default:
+			failure(w, 500, "server_error")
+		}
+		return "", Client{}, false
+	}
+	id, client, ok := s.authenticateLegacy(r, p)
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
+		failure(w, 401, "invalid_client")
+	}
+	return id, client, ok
+}
+
+func (s Server) authenticateLegacy(r *http.Request, p url.Values) (string, Client, bool) {
 	if len(r.Header.Values("Authorization")) > 1 {
 		return "", Client{}, false
 	}
@@ -277,14 +369,14 @@ func (s Server) authenticate(r *http.Request, p url.Values) (string, Client, boo
 			return "", Client{}, false
 		}
 		c, ok := s.Clients[name]
-		return name, c, ok && c.SecretDigest != "" && !p.Has("client_secret") && !p.Has("client_id") && equal(store.Digest(secret), c.SecretDigest)
+		return name, c, ok && !c.PrivateKeyJWT && c.SecretDigest != "" && !p.Has("client_secret") && !p.Has("client_id") && equal(store.Digest(secret), c.SecretDigest)
 	}
 	name = p.Get("client_id")
 	if len(r.Header.Values("Authorization")) != 0 || p.Has("client_secret") {
 		return "", Client{}, false
 	}
 	c, _, ok := s.resolveClient(r.Context(), name)
-	return name, c, ok && c.SecretDigest == ""
+	return name, c, ok && c.SecretDigest == "" && !c.PrivateKeyJWT
 }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 
@@ -294,10 +386,8 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "invalid_request")
 		return
 	}
-	client, metadata, authenticated := s.authenticate(r, p)
+	client, metadata, authenticated := s.authenticate(w, r, p, "token")
 	if !authenticated {
-		w.Header().Set("WWW-Authenticate", `Basic realm="token"`)
-		failure(w, 401, "invalid_client")
 		return
 	}
 	grant := p.Get("grant_type")
@@ -386,7 +476,7 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s Server) exchange(w http.ResponseWriter, r *http.Request, p url.Values, client, jkt string) {
-	if s.Clients[client].SecretDigest == "" {
+	if metadata := s.Clients[client]; metadata.SecretDigest == "" && !metadata.PrivateKeyJWT {
 		failure(w, 400, "access_denied")
 		return
 	}

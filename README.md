@@ -1,6 +1,6 @@
 # BastionAuth
 
-BastionAuth is a Go authorization service with S256 PKCE, MCP Client ID Metadata Documents, pushed authorization requests, rich authorization requests, delegated token exchange, and DPoP sender-constrained access tokens. Each deployment selects a tenant from server configuration. PostgreSQL policies enforce that tenant on every application transaction.
+BastionAuth is a Go authorization service with S256 PKCE, MCP Client ID Metadata Documents, JWT-secured and pushed authorization requests, rich authorization requests, private-key JWT client authentication, delegated token exchange, and DPoP sender-constrained access tokens. Each deployment selects a tenant from server configuration. PostgreSQL policies enforce that tenant on every application transaction.
 
 ```mermaid
 flowchart LR
@@ -19,15 +19,16 @@ flowchart LR
 
 | Endpoint | Input and behavior |
 | --- | --- |
-| `GET /oauth/authorize` | Renders consent for an authenticated session. Accepts a PAR reference or a direct request with `response_type=code`, an exact `redirect_uri`, `state`, S256 PKCE, and `scope`, `authorization_details`, or both. Accepts optional `dpop_jkt` for code binding. |
+| `GET /oauth/authorize` | Renders consent for an authenticated session. Accepts a PAR reference, a signed Request Object by value or registered HTTPS reference, or a direct request with `response_type=code`, an exact `redirect_uri`, `state`, S256 PKCE, and `scope`, `authorization_details`, or both. Accepts optional `dpop_jkt` for code binding. |
 | `POST /oauth/authorize` | Processes the rendered consent form. Checks the HTTPS origin and session-bound form integrity, then redirects with the original `state` and a single-use code or denial. Clients verify `state` against their initiating session. |
-| `POST /oauth/par` | Validates a form-encoded authorization request and returns HTTP 201 with a single-use `request_uri` and `expires_in`. |
-| `POST /oauth/token` | Accepts form-encoded authorization-code, rotating refresh-token, and RFC 8693 requests with a fresh `DPoP` header. Public clients send `client_id`. Confidential clients use `client_secret_basic`. |
+| `POST /oauth/par` | Validates form-encoded authorization parameters or a signed Request Object and returns HTTP 201 with a single-use `request_uri` and `expires_in`. |
+| `POST /oauth/token` | Accepts form-encoded authorization-code, rotating refresh-token, and RFC 8693 requests with a fresh `DPoP` header. Public clients send `client_id`. Confidential clients use `client_secret_basic` or `private_key_jwt`. |
 | `POST /oauth/grant/revoke` | Accepts form-encoded `client_id` from the user’s session and same origin. Revokes all codes and refresh tokens for that client grant. |
 | `GET /.well-known/oauth-authorization-server` | Advertises the authorization, token, PAR, and JWKS endpoints and whether CIMD is enabled. |
 | `GET /.well-known/jwks.json` | Serves the active public Ed25519 signing key. |
+| `GET /metrics` | Exposes Prometheus histograms and OAuth outcome counters. |
 
-RFC 8693 requests use `urn:ietf:params:oauth:grant-type:token-exchange`, two access-token type identifiers (`urn:ietf:params:oauth:token-type:access_token`), and a configured `audience`. The client authenticates with its secret and presents an actor token naming that same client. The subject token must authorize that actor via `may_act`. Each requested scope must appear on both tokens and in the target policy. Unrecognized target, actor, or delegation fails with `access_denied`. Scope escalation fails with `invalid_scope`. An omitted `scope` defaults to the intersection of the subject scopes, actor scopes, and target policy. See the design RFC for the database and verification invariants. [RFC 001](rfcs/001-token-exchange-and-rls.md)
+RFC 8693 requests use `urn:ietf:params:oauth:grant-type:token-exchange`, two access-token type identifiers (`urn:ietf:params:oauth:token-type:access_token`), and a configured `audience`. The confidential client authenticates and presents an actor token naming that same client. The subject token must authorize that actor via `may_act`. Each requested scope must appear on both tokens and in the target policy. Unrecognized target, actor, or delegation fails with `access_denied`. Scope escalation fails with `invalid_scope`. An omitted `scope` defaults to the intersection of the subject scopes, actor scopes, and target policy. See the design RFC for the database and verification invariants. [RFC 001](rfcs/001-token-exchange-and-rls.md)
 
 ### MCP client metadata
 
@@ -35,11 +36,23 @@ Set `CIMDScopes` to enable HTTPS metadata-document URLs as public client IDs and
 
 ### Pushed and rich authorization requests
 
-Submit the authorization parameters to `POST /oauth/par` using the same public identification or confidential client authentication as the token endpoint. Pass only `client_id` and the returned `request_uri` to `GET /oauth/authorize`. The reference expires after 60 seconds and is consumed atomically when an authenticated user opens it. The consent form and token redemption use the original request’s PKCE challenge.
+Submit the authorization parameters to `POST /oauth/par` using the same public identification or confidential client authentication as the token endpoint. Pass only `client_id` and the returned `request_uri` to `GET /oauth/authorize`. The reference expires after at most 60 seconds and is consumed atomically when an authenticated user opens it. The consent form and token redemption use the original request’s PKCE challenge.
 
 `authorization_details` is a JSON array of objects with a `type` and any common or type-specific constraints. For example, `[{"type":"inventory","identifier":"warehouse-1","actions":["read"]}]` requests read access to one inventory. BastionAuth shows the approved details at consent and carries them into access tokens and refresh rotations. Resource servers enforce the details alongside the audience and scope.
 
 During token exchange, an omitted `authorization_details` inherits the subject token’s details if permitted by the actor token. Each requested object must fit within one complete subject grant and, when the actor token has details, one complete actor grant. An exchange can drop entire objects or narrow the `actions`, `locations`, `datatypes`, and `privileges` lists. It must retain the object’s type, identifier, and type-specific values. Widening fails with `invalid_authorization_details`.
+
+### Signed Request Objects and client assertions
+
+Register public signing JWKs in a static client’s `JWTKeys`. BastionAuth accepts `PS256` (RSA keys of at least 2048 bits), `ES256`, and `EdDSA` (Ed25519). Configure `RequireJAR: true` to require RFC 9101 Request Objects for that client. Sign the authorization parameters together with `iss` and `client_id` set to the registered client ID, `aud` set to the authorization server issuer, and `exp`, `nbf`, and a fresh `jti`. The server accepts expiration up to five minutes ahead. Encode `authorization_details` as a JSON array within the JWT.
+
+Send `client_id` and either `request` or `request_uri` to `GET /oauth/authorize`. For an HTTPS reference, register its exact URL in the client’s `RequestURIs`. The server fetches the object over verified HTTPS using only public IPs, with a five-second timeout, a 64 KiB body limit, and redirects disabled. At `POST /oauth/par`, send the object as `request` alongside the client authentication fields and use the returned PAR reference at the authorization endpoint. Replay protection is scoped to the tenant, client, and JWT purpose and is shared across service instances using PostgreSQL. Consent for a signed request uses a single-use nonce bound to the session and the approved authorization parameters.
+
+Configure `PrivateKeyJWT: true` to use RFC 7523 authentication at `/oauth/token` and `/oauth/par`. Set `client_assertion_type` to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion` to the signed JWT. Set both `iss` and `sub` to the client ID, and set `aud` to the server issuer or the exact endpoint URL. Supply a fresh `jti` and an `exp` up to five minutes ahead. If present, `nbf` must have elapsed. Use the registered public key’s unpadded base64url RFC 7638 SHA-256 thumbprint as the assertion’s `kid`. The server computes this thumbprint from the registered key before verifying the signature. This authentication method replaces the shared secret for that client.
+
+### Metrics
+
+Scrape `GET /metrics` from the service listener and restrict its exposure at the ingress. The OpenTelemetry Prometheus exporter publishes `http_request_duration_seconds` for requests handled by the OAuth mux, with HTTP method, status code, and matched route labels. It also publishes `oauth_requests_total`, `oauth_exchange_requests_total`, and `oauth_par_requests_total` with bounded outcome labels. Token exchange and PAR are included in the aggregate OAuth counter.
 
 ## Run
 
@@ -113,4 +126,4 @@ go run ./benchmarks/run_bench.go -requests 4000 -workers 16
 
 The benchmark uses a loopback HTTP server, real token signatures, a served JWKS, unique DPoP proofs, and the in-memory replay store. Throughput and latency come from the concurrent HTTP run. Allocations per operation come from Go’s `testing.Benchmark` and include both HTTP peers. [Measured results](benchmarks/RESULTS.md)
 
-The Wave 3 run completed 4,000 token exchange requests with 16 workers and zero failures. It measured 3,861.18 requests/s, with p50 at 3.446477 ms, p95 at 8.190801 ms, and p99 at 10.952736 ms. The PostgreSQL-backed race suite passed 15 tests and 87 subtests with zero data race reports.
+The Wave 4 loopback run completed 4,000 token exchange requests with 16 workers and zero failures. It measured 5,177.61 requests/s, with p50 at 2.515217 ms, p95 at 5.797908 ms, and p99 at 10.137766 ms. The PostgreSQL-backed race suite passed 17 tests and 98 subtests with zero skips and zero data race reports.

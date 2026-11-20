@@ -20,7 +20,7 @@ func Matches(algorithm string, key any) bool {
 	case *ecdsa.PublicKey:
 		return algorithm == string(jose.ES256) && k.Curve == elliptic.P256()
 	case *rsa.PublicKey:
-		return algorithm == string(jose.RS256) && k.N.BitLen() >= 2048
+		return (algorithm == string(jose.RS256) || algorithm == string(jose.PS256)) && k.N.BitLen() >= 2048
 	}
 	return false
 }

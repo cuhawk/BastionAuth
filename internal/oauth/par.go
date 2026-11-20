@@ -12,6 +12,7 @@ import (
 )
 
 const pushedRequestPrefix = "urn:ietf:params:oauth:request_uri:"
+const pushedSignedMarker = "_signed_request_object"
 const pushedRequestTTL = 60 * time.Second
 
 func (s Server) pushAuthorization(w http.ResponseWriter, r *http.Request) {
@@ -21,25 +22,53 @@ func (s Server) pushAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for key := range p {
-		if !slices.Contains(authorizationFields, key) {
+		if key != "request" && key != "client_assertion" && key != "client_assertion_type" && !slices.Contains(authorizationFields, key) {
 			failure(w, 400, "invalid_request")
 			return
 		}
 	}
-	id, client, authenticated := s.authenticate(r, p)
+	id, client, authenticated := s.authenticate(w, r, p, "par")
 	if !authenticated {
-		w.Header().Set("WWW-Authenticate", `Basic realm="par"`)
-		failure(w, 401, "invalid_client")
 		return
 	}
+	var identity signedIdentity
+	if p.Has("request") {
+		if len(p) != 1+countAuthenticationFields(p) {
+			failure(w, 400, "invalid_request")
+			return
+		}
+		var err error
+		p, identity, err = s.requestObject(p.Get("request"), id, client)
+		if err != nil {
+			failure(w, 400, "invalid_request_object")
+			return
+		}
+	} else if client.RequireJAR {
+		failure(w, 400, "invalid_request_object")
+		return
+	}
+	p.Del("client_assertion")
+	p.Del("client_assertion_type")
 	p.Set("client_id", id)
 	if _, _, code := validateAuthorization(p, client); code != "" {
 		failure(w, 400, code)
 		return
 	}
+	now := time.Now()
+	expires := now.Add(pushedRequestTTL)
+	if identity.id != "" {
+		if status, code := s.claimRequestObject(r.Context(), identity); code != "" {
+			failure(w, status, code)
+			return
+		}
+		p.Set(pushedSignedMarker, "1")
+		if identity.expires.Before(expires) {
+			expires = identity.expires
+		}
+	}
 	secret := store.Secret()
 	if err := s.Store.SavePushedRequest(r.Context(), s.Tenant, store.Digest(secret), store.PushedRequest{
-		Client: id, Form: p.Encode(), Expires: time.Now().Add(pushedRequestTTL),
+		Client: id, Form: p.Encode(), Expires: expires,
 	}); err != nil {
 		failure(w, 500, "server_error")
 		return
@@ -47,7 +76,17 @@ func (s Server) pushAuthorization(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusCreated, struct {
 		URI     string `json:"request_uri"`
 		Expires int    `json:"expires_in"`
-	}{pushedRequestPrefix + secret, int(pushedRequestTTL.Seconds())})
+	}{pushedRequestPrefix + secret, int((expires.Sub(now) + time.Second - 1) / time.Second)})
+}
+
+func countAuthenticationFields(p url.Values) int {
+	count := 0
+	for _, field := range []string{"client_id", "client_assertion", "client_assertion_type"} {
+		if p.Has(field) {
+			count++
+		}
+	}
+	return count
 }
 
 func (s Server) takeAuthorization(r *http.Request, p url.Values) (url.Values, string, string, int, string) {

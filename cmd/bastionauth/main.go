@@ -166,6 +166,9 @@ func (c config) validate() error {
 		if name == "" {
 			return errors.New("empty client ID")
 		}
+		if err := client.ValidateSigning(); err != nil {
+			return fmt.Errorf("client %q: %w", name, err)
+		}
 		for _, redirect := range client.Redirects {
 			u, ok := httpsURL(redirect)
 			if !ok || u.Query().Has("code") || u.Query().Has("error") || u.Query().Has("state") {
