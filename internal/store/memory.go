@@ -19,17 +19,27 @@ type entry struct {
 }
 
 type Memory struct {
-	mu           sync.Mutex
-	grants       map[grantKey]grant
-	credentials  map[credentialKey]entry
-	proofs       map[proofKey]time.Time
-	nextSweep    time.Time
-	pushed       map[credentialKey]PushedRequest
-	nextPARSweep time.Time
+	mu              sync.Mutex
+	access          map[credentialKey]accessEntry
+	accessByJTI     map[credentialKey]credentialKey
+	nextAccessSweep time.Time
+	grants          map[grantKey]grant
+	credentials     map[credentialKey]entry
+	proofs          map[proofKey]time.Time
+	nextSweep       time.Time
+	pushed          map[credentialKey]PushedRequest
+	nextPARSweep    time.Time
 }
 
 func NewMemory() *Memory {
-	return &Memory{pushed: make(map[credentialKey]PushedRequest), grants: make(map[grantKey]grant), credentials: make(map[credentialKey]entry), proofs: make(map[proofKey]time.Time)}
+	return &Memory{
+		grants:      make(map[grantKey]grant),
+		credentials: make(map[credentialKey]entry),
+		access:      make(map[credentialKey]accessEntry),
+		accessByJTI: make(map[credentialKey]credentialKey),
+		pushed:      make(map[credentialKey]PushedRequest),
+		proofs:      make(map[proofKey]time.Time),
+	}
 }
 
 func (m *Memory) Consent(ctx context.Context, tenant, digest string, c Credential) error {
@@ -55,11 +65,7 @@ func (m *Memory) Revoke(ctx context.Context, tenant, user, client string) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	k := grantKey{tenant, user, client}
-	g := m.grants[k]
-	g.generation++
-	g.active = false
-	m.grants[k] = g
+	m.revokeGrant(grantKey{tenant, user, client})
 	return nil
 }
 
@@ -72,14 +78,23 @@ func (m *Memory) Rotate(ctx context.Context, tenant, oldDigest, newDigest string
 	oldKey := credentialKey{tenant, oldDigest}
 	e, ok := m.credentials[oldKey]
 	g := m.grants[grantKey{tenant, e.credential.User, e.credential.Client}]
-	if !ok || !g.active || e.generation != g.generation {
+	if !ok || !g.active || e.generation != g.generation || e.credential.Kind == spentRefresh {
 		return ErrInvalid
 	}
 	next, err := issue(e.credential)
 	if err != nil {
 		return err
 	}
-	delete(m.credentials, oldKey)
+	if next.Access != nil {
+		m.saveAccess(tenant, *next.Access, e.generation)
+		next.Access = nil
+	}
+	if e.credential.Kind == "refresh_token" {
+		e.credential.Kind = spentRefresh
+		m.credentials[oldKey] = e
+	} else {
+		delete(m.credentials, oldKey)
+	}
 	m.credentials[credentialKey{tenant, newDigest}] = entry{next, e.generation}
 	return nil
 }

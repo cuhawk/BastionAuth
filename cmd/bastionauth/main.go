@@ -30,6 +30,8 @@ type trust struct{ Issuer, Audience, JWKSURL string }
 type config struct {
 	Tenant, Origin, Audience, Issuer, KeyID, SigningKeyFile, Listen string
 	Clients                                                         map[string]oauth.Client
+	Resource                                                        string
+	ResourceServers                                                 map[string][]string
 	Targets                                                         map[string][]string
 	CIMDScopes                                                      []string
 	Sessions, Exchange                                              trust
@@ -109,7 +111,7 @@ func run() error {
 		return errors.New("database role must enforce row-level security")
 	}
 	db := store.Postgres{Pool: pool}
-	s := oauth.Server{Tenant: cfg.Tenant, Origin: cfg.Origin, Audience: cfg.Audience, Clients: cfg.Clients, Store: db, Sessions: cfg.Sessions.verifier(), DPoP: dpop.Verifier{Store: db}, Exchange: exchange.Service{Verifier: cfg.Exchange.verifier(), Issuer: exchange.Issuer{Name: cfg.Issuer, Signer: signer}, Targets: cfg.Targets}}
+	s := oauth.Server{Tenant: cfg.Tenant, Origin: cfg.Origin, Audience: cfg.Audience, Resource: cfg.Resource, Clients: cfg.Clients, ResourceServers: cfg.ResourceServers, Store: db, Sessions: cfg.Sessions.verifier(), DPoP: dpop.Verifier{Store: db}, Exchange: exchange.Service{Verifier: cfg.Exchange.verifier(), Issuer: exchange.Issuer{Name: cfg.Issuer, Signer: signer}, Targets: cfg.Targets}}
 	if cfg.CIMDScopes != nil {
 		s.CIMD = oauth.NewCIMDResolver()
 		s.CIMDScopes = cfg.CIMDScopes
@@ -151,7 +153,7 @@ func (c config) validate() error {
 		}
 	}
 	origin, ok := httpsURL(c.Origin)
-	if !ok || origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || c.Tenant == "" || c.Audience == "" || c.Issuer == "" || c.KeyID == "" || c.SigningKeyFile == "" || c.Listen == "" || (len(c.Clients) == 0 && c.CIMDScopes == nil) {
+	if !ok || origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || c.Tenant == "" || c.Audience == "" || c.KeyID == "" || c.SigningKeyFile == "" || c.Listen == "" || (len(c.Clients) == 0 && c.CIMDScopes == nil) {
 		return errors.New("missing or invalid server configuration")
 	}
 	for _, t := range []trust{c.Sessions, c.Exchange} {
@@ -162,6 +164,27 @@ func (c config) validate() error {
 	if c.Sessions.Issuer == c.Exchange.Issuer && c.Sessions.Audience == c.Exchange.Audience {
 		return errors.New("session and exchange trust must use separate token audiences or issuers")
 	}
+	issuer, ok := httpsURL(c.Issuer)
+	if !ok || issuer.ForceQuery || issuer.RawQuery != "" || strings.Contains(c.Issuer, "\\") {
+		return errors.New("invalid authorization server issuer")
+	}
+	if c.Resource != "" {
+		_, ok := httpsURL(c.Resource)
+		if !ok || strings.Contains(c.Resource, "\\") {
+			return errors.New("invalid protected resource identifier")
+		}
+	}
+	for id, audiences := range c.ResourceServers {
+		client := c.Clients[id]
+		if (client.SecretDigest == "" && !client.PrivateKeyJWT) || len(audiences) == 0 {
+			return fmt.Errorf("resource server %q needs confidential credentials and at least one audience", id)
+		}
+		for _, audience := range audiences {
+			if _, target := c.Targets[audience]; audience == "" || (audience != c.Audience && !target) {
+				return fmt.Errorf("unknown audience configured for resource server %q", id)
+			}
+		}
+	}
 	for name, client := range c.Clients {
 		if name == "" {
 			return errors.New("empty client ID")
@@ -170,8 +193,7 @@ func (c config) validate() error {
 			return fmt.Errorf("client %q: %w", name, err)
 		}
 		for _, redirect := range client.Redirects {
-			u, ok := httpsURL(redirect)
-			if !ok || u.Query().Has("code") || u.Query().Has("error") || u.Query().Has("state") {
+			if !oauth.ValidRedirectURI(redirect, false) {
 				return fmt.Errorf("invalid redirect for client %q", name)
 			}
 		}

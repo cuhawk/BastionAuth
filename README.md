@@ -23,12 +23,21 @@ flowchart LR
 | `POST /oauth/authorize` | Processes the rendered consent form. Checks the HTTPS origin and session-bound form integrity, then redirects with the original `state` and a single-use code or denial. Clients verify `state` against their initiating session. |
 | `POST /oauth/par` | Validates form-encoded authorization parameters or a signed Request Object and returns HTTP 201 with a single-use `request_uri` and `expires_in`. |
 | `POST /oauth/token` | Accepts form-encoded authorization-code, rotating refresh-token, and RFC 8693 requests with a fresh `DPoP` header. Public clients send `client_id`. Confidential clients use `client_secret_basic` or `private_key_jwt`. |
-| `POST /oauth/grant/revoke` | Accepts form-encoded `client_id` from the user’s session and same origin. Revokes all codes and refresh tokens for that client grant. |
-| `GET /.well-known/oauth-authorization-server` | Advertises the authorization, token, PAR, and JWKS endpoints and whether CIMD is enabled. |
+| `POST /oauth/grant/revoke` | Accepts form-encoded `client_id` from the user’s session and same origin. Revokes all codes, refresh tokens, and tracked access tokens for that client grant. |
+| `POST /oauth/revoke` | RFC 7009. A confidential client submits an access or refresh token in the form field `token`. Revokes the owning grant and returns HTTP 200 with an empty body for successful, unknown, and foreign-token requests. |
+| `POST /oauth/introspect` | RFC 7662. An authenticated resource server submits an access token in `token`. Returns active claims for its authorized audiences, or `{"active":false}` for unknown, expired, revoked, or out-of-audience tokens. |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414. Advertises authorization, token, PAR, revocation, introspection, and JWKS endpoints, plus supported authentication and DPoP algorithms. |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728. Advertises the protected resource identifier, its authorization server, and its DPoP requirement. |
 | `GET /.well-known/jwks.json` | Serves the active public Ed25519 signing key. |
 | `GET /metrics` | Exposes Prometheus histograms and OAuth outcome counters. |
 
 RFC 8693 requests use `urn:ietf:params:oauth:grant-type:token-exchange`, two access-token type identifiers (`urn:ietf:params:oauth:token-type:access_token`), and a configured `audience`. The confidential client authenticates and presents an actor token naming that same client. The subject token must authorize that actor via `may_act`. Each requested scope must appear on both tokens and in the target policy. Unrecognized target, actor, or delegation fails with `access_denied`. Scope escalation fails with `invalid_scope`. An omitted `scope` defaults to the intersection of the subject scopes, actor scopes, and target policy. See the design RFC for the database and verification invariants. [RFC 001](rfcs/001-token-exchange-and-rls.md)
+
+### Revocation, introspection, and discovery
+
+The revocation and introspection endpoints accept `client_secret_basic` and `private_key_jwt`. Configure `ResourceServers` with each confidential resource server's client ID and the access token audiences it may introspect. Active responses contain `scope`, `sub`, `client_id`, `exp`, and `cnf.jkt`. Resource servers still verify possession of the DPoP key. Revocation also reaches authorization codes and refresh tokens from the same grant generation, including refresh tokens rotated before revocation. A subsequent consent opens a new generation without reviving earlier credentials.
+
+Discovery identifies the protected resource through `Resource`, which defaults to `Audience` when it is an HTTPS URL. Set `Resource` explicitly for an opaque audience identifier. Serve the resource metadata route on the resource's origin, forwarding it to BastionAuth if the origins differ. For issuer and resource identifiers with paths, use the corresponding path-qualified well-known URLs. Callback URLs reject fragments, malformed queries, and reserved OAuth parameters in their configured query strings.
 
 ### MCP client metadata
 
@@ -48,7 +57,7 @@ Register public signing JWKs in a static client’s `JWTKeys`. BastionAuth accep
 
 Send `client_id` and either `request` or `request_uri` to `GET /oauth/authorize`. For an HTTPS reference, register its exact URL in the client’s `RequestURIs`. The server fetches the object over verified HTTPS using only public IPs, with a five-second timeout, a 64 KiB body limit, and redirects disabled. At `POST /oauth/par`, send the object as `request` alongside the client authentication fields and use the returned PAR reference at the authorization endpoint. Replay protection is scoped to the tenant, client, and JWT purpose and is shared across service instances using PostgreSQL. Consent for a signed request uses a single-use nonce bound to the session and the approved authorization parameters.
 
-Configure `PrivateKeyJWT: true` to use RFC 7523 authentication at `/oauth/token` and `/oauth/par`. Set `client_assertion_type` to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion` to the signed JWT. Set both `iss` and `sub` to the client ID, and set `aud` to the server issuer or the exact endpoint URL. Supply a fresh `jti` and an `exp` up to five minutes ahead. If present, `nbf` must have elapsed. Use the registered public key’s unpadded base64url RFC 7638 SHA-256 thumbprint as the assertion’s `kid`. The server computes this thumbprint from the registered key before verifying the signature. This authentication method replaces the shared secret for that client.
+Configure `PrivateKeyJWT: true` to use RFC 7523 authentication at `/oauth/token`, `/oauth/par`, `/oauth/revoke`, and `/oauth/introspect`. Set `client_assertion_type` to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion` to the signed JWT. Set both `iss` and `sub` to the client ID, and set `aud` to the server issuer or the exact endpoint URL. Supply a fresh `jti` and an `exp` up to five minutes ahead. If present, `nbf` must have elapsed. Use the registered public key’s unpadded base64url RFC 7638 SHA-256 thumbprint as the assertion’s `kid`. The server computes this thumbprint from the registered key before verifying the signature. This authentication method replaces the shared secret for that client.
 
 ### Metrics
 
@@ -61,7 +70,7 @@ Use Go 1.25+, a C compiler for the PostgreSQL parser and race detector, and Post
 ```sh
 psql "$MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 \
   -f migrations/001_core.sql -f migrations/002_expiration_indexes.sql \
-  -f migrations/003_pushed_requests.sql
+  -f migrations/003_pushed_requests.sql -f migrations/004_access_tokens.sql
 openssl genpkey -algorithm ED25519 -out signing-key.pem
 go run ./cmd/bastionauth config.json
 ```
@@ -84,9 +93,15 @@ Example `config.json`:
       "Redirects": ["https://web.example.com/callback"],
       "Scopes": ["inventory:read"]
     },
+    "inventory-api": {
+      "SecretDigest": "REPLACE_WITH_BASE64URL_SHA256_OF_THE_RESOURCE_SERVER_SECRET"
+    },
     "delegate": {
       "SecretDigest": "REPLACE_WITH_BASE64URL_SHA256_OF_A_HIGH_ENTROPY_CLIENT_SECRET"
     }
+  },
+  "ResourceServers": {
+    "inventory-api": ["https://api.example.com"]
   },
   "CIMDScopes": ["inventory:read"],
   "Targets": {
@@ -105,14 +120,14 @@ Example `config.json`:
 }
 ```
 
-An upstream identity service supplies the `__Host-bastion_session` cookie on the authorization origin with `Secure`, `HttpOnly`, `Path=/`, and a suitable SameSite policy. The cookie contains a signed `at+jwt` with the configured issuer, sole session audience, tenant, subject, and expiration. The exchange trust configuration accepts `at+jwt` assertions from its configured issuer and audience. Store signing keys and client secrets in a secret manager, use high-entropy confidential-client secrets, and give their unpadded base64url SHA-256 digests to BastionAuth. Schedule expired credential cleanup in tenant-scoped transactions using the `(tenant_id, expires_at)` index.
+An upstream identity service supplies the `__Host-bastion_session` cookie on the authorization origin with `Secure`, `HttpOnly`, `Path=/`, and a suitable SameSite policy. The cookie contains a signed `at+jwt` with the configured issuer, sole session audience, tenant, subject, and expiration. The exchange trust configuration accepts `at+jwt` assertions from its configured issuer and audience. Store signing keys and client secrets in a secret manager, use high-entropy confidential-client secrets, and give their unpadded base64url SHA-256 digests to BastionAuth. Schedule expired credential and access token cleanup in tenant-scoped transactions using the `(tenant_id, expires_at)` index.
 
 ## Threat model and scope
 
 - A leaked authorization code requires its verifier and exact registered redirect URI. A leaked DPoP-bound token requires the corresponding signing key and a fresh proof. Resource servers verify token claims, `cnf.jkt`, and `ath` using the public JWKS and a shared replay store. They enforce the resource’s audience and application scopes.
-- Revocation and token rotation serialize on the same grant. Codes or refresh tokens from earlier generations fail with `invalid_grant` after revocation, including after re-consent. Already issued access tokens expire on their short TTL.
+- Revocation and token rotation serialize on the same grant. Codes or refresh tokens from earlier generations fail with `invalid_grant` after revocation, including after re-consent. Tracked access-token JTIs are denylisted until expiration. Resource servers can enforce revocation through introspection or the shared store in `dpop.Verifier.VerifyAccess`. Access tokens issued before migration have no tracking records and expire on their original TTL.
 - Missing tenant settings fail closed under RLS. The control assumes the service controls the tenant setting and database role. A compromised application database credential can set tenant context, so the role and connection must remain private.
-- Invalid proofs, replay, wrong issuer or audience, JWKS refresh failures, and unavailable state storage cause request failure. A valid cached JWKS remains usable until its cache TTL. Configure an upstream identity provider for interactive login and a resource server for application authorization. Dynamic registration, password grants, login UI, DPoP nonces, and online introspection are outside the service’s scope.
+- Invalid proofs, replay, wrong issuer or audience, JWKS refresh failures, and unavailable state storage cause request failure. A valid cached JWKS remains usable until its cache TTL. Configure an upstream identity provider for interactive login and a resource server for application authorization. Dynamic registration, password grants, login UI, and DPoP nonces are outside the service’s scope.
 
 ## Verify and benchmark
 
@@ -126,4 +141,4 @@ go run ./benchmarks/run_bench.go -requests 4000 -workers 16
 
 The benchmark uses a loopback HTTP server, real token signatures, a served JWKS, unique DPoP proofs, and the in-memory replay store. Throughput and latency come from the concurrent HTTP run. Allocations per operation come from Go’s `testing.Benchmark` and include both HTTP peers. [Measured results](benchmarks/RESULTS.md)
 
-The Wave 4 loopback run completed 4,000 token exchange requests with 16 workers and zero failures. It measured 5,177.61 requests/s, with p50 at 2.515217 ms, p95 at 5.797908 ms, and p99 at 10.137766 ms. The PostgreSQL-backed race suite passed 17 tests and 98 subtests with zero skips and zero data race reports.
+The Wave 6 loopback run completed 4,000 requests with 16 workers and zero failures. It measured 4,365.89 requests/s, with p50 at 3.041158ms, p95 at 7.327932ms, p99 at 9.386723ms, and 802 allocations per operation. The race suite passed 19 tests and 99 subtests against PostgreSQL 16.16, with 0 test skips and no data race reports.

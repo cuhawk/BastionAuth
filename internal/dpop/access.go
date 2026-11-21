@@ -13,6 +13,9 @@ func (v Verifier) VerifyAccess(ctx context.Context, tokens exchange.Verifier, te
 	if err != nil || c.CNF == nil || c.CNF.JKT == "" {
 		return exchange.Claims{}, ErrProof
 	}
+	if revoked, err := v.Store.AccessRevoked(ctx, tenant, c.ID); err != nil || revoked {
+		return exchange.Claims{}, ErrProof
+	}
 	if _, err := v.Verify(ctx, tenant, proof, method, target, accessToken, c.CNF.JKT); err != nil {
 		return exchange.Claims{}, err
 	}

@@ -36,6 +36,7 @@ type Claims struct {
 	AuthorizationDetails Details       `json:"authorization_details,omitempty"`
 	Tenant               string        `json:"tenant_id"`
 	Scope                string        `json:"scope"`
+	ClientID             string        `json:"client_id,omitempty"`
 	Act                  *Actor        `json:"act,omitempty"`
 	MayAct               *Actor        `json:"may_act,omitempty"`
 	CNF                  *Confirmation `json:"cnf,omitempty"`
@@ -149,11 +150,17 @@ func (i Issuer) Mint(tenant, subject, audience, scope, jkt string, act *Actor, e
 }
 
 func (i Issuer) MintWithDetails(tenant, subject, audience, scope, jkt string, act *Actor, expiry time.Time, details Details) (string, error) {
-	c := Claims{AuthorizationDetails: details, Claims: jwt.Claims{Issuer: i.Name, Subject: subject, Audience: jwt.Audience{audience}, IssuedAt: jwt.NewNumericDate(time.Now()), Expiry: jwt.NewNumericDate(expiry), ID: store.Secret()}, Tenant: tenant, Scope: scope, Act: act}
+	raw, _, err := i.MintForClient(tenant, subject, "", audience, scope, jkt, act, expiry, details)
+	return raw, err
+}
+
+func (i Issuer) MintForClient(tenant, subject, client, audience, scope, jkt string, act *Actor, expiry time.Time, details Details) (raw, jti string, err error) {
+	c := Claims{ClientID: client, AuthorizationDetails: details, Claims: jwt.Claims{Issuer: i.Name, Subject: subject, Audience: jwt.Audience{audience}, IssuedAt: jwt.NewNumericDate(time.Now()), Expiry: jwt.NewNumericDate(expiry), ID: store.Secret()}, Tenant: tenant, Scope: scope, Act: act}
 	if jkt != "" {
 		c.CNF = &Confirmation{JKT: jkt}
 	}
-	return jwt.Signed(i.Signer).Claims(c).Serialize()
+	raw, err = jwt.Signed(i.Signer).Claims(c).Serialize()
+	return raw, c.ID, err
 }
 
 type Service struct {
@@ -165,6 +172,7 @@ type Service struct {
 type Result struct {
 	AuthorizationDetails Details
 	AccessToken          string
+	JTI, Subject         string
 	Scope                string
 	ExpiresAt            time.Time
 }
@@ -239,11 +247,11 @@ func (s Service) ExchangeWithDetails(ctx context.Context, tenant, client, subjec
 	}
 	act := &Actor{Subject: actor.Subject, Issuer: actor.Issuer, Act: subject.Act}
 	scope := strings.Join(scopes, " ")
-	access, err := s.Issuer.MintWithDetails(tenant, subject.Subject, audience, scope, jkt, act, expiry, details)
+	access, jti, err := s.Issuer.MintForClient(tenant, subject.Subject, client, audience, scope, jkt, act, expiry, details)
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{AuthorizationDetails: details, AccessToken: access, Scope: scope, ExpiresAt: expiry.Truncate(time.Second)}, nil
+	return Result{AuthorizationDetails: details, AccessToken: access, JTI: jti, Subject: subject.Subject, Scope: scope, ExpiresAt: expiry.Truncate(time.Second)}, nil
 }
 
 func claimScopes(claims Claims) ([]string, error) {

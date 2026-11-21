@@ -60,8 +60,7 @@ func (p Postgres) Consent(ctx context.Context, tenant, digest string, c Credenti
 
 func (p Postgres) Revoke(ctx context.Context, tenant, user, client string) error {
 	return p.WithTenantTx(ctx, tenant, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE grants SET active=false,generation=generation+1 WHERE tenant_id=$1 AND user_id=$2 AND client_id=$3`, tenant, user, client)
-		return err
+		return revokeGrant(ctx, tx, tenant, user, client, nil)
 	})
 }
 
@@ -88,7 +87,7 @@ func (p Postgres) Rotate(ctx context.Context, tenant, oldDigest, newDigest strin
 			return ErrInvalid
 		}
 		var payload []byte
-		err = tx.QueryRow(ctx, `DELETE FROM credentials WHERE tenant_id=$1 AND digest=$2 AND generation=$3 RETURNING payload`, tenant, oldDigest, generation).Scan(&payload)
+		err = tx.QueryRow(ctx, `SELECT payload FROM credentials WHERE tenant_id=$1 AND digest=$2 AND generation=$3`, tenant, oldDigest, generation).Scan(&payload)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrInvalid
 		}
@@ -99,9 +98,25 @@ func (p Postgres) Rotate(ctx context.Context, tenant, oldDigest, newDigest strin
 		if err = json.Unmarshal(payload, &old); err != nil {
 			return err
 		}
+		if old.Kind == spentRefresh {
+			return ErrInvalid
+		}
 		next, err := issue(old)
 		if err != nil {
 			return err
+		}
+		if old.Kind == "refresh_token" {
+			_, err = tx.Exec(ctx, `UPDATE credentials SET payload=jsonb_set(payload,'{Kind}',to_jsonb($3::text)) WHERE tenant_id=$1 AND digest=$2`, tenant, oldDigest, spentRefresh)
+		} else {
+			_, err = tx.Exec(ctx, `DELETE FROM credentials WHERE tenant_id=$1 AND digest=$2`, tenant, oldDigest)
+		}
+		if err != nil {
+			return err
+		}
+		if next.Access != nil {
+			if err := saveAccess(ctx, tx, tenant, *next.Access, generation); err != nil {
+				return err
+			}
 		}
 		return save(ctx, tx, tenant, newDigest, generation, next)
 	})
