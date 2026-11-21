@@ -15,9 +15,19 @@ type Credential struct {
 	User, Client, Kind, Redirect, Challenge, Scope, JKT string
 	AuthorizationDetails                                string `json:",omitempty"`
 	Expires                                             time.Time
+	Access                                              *AccessToken `json:"-"` // Set by Rotate when issuing an access token with the refresh token.
+}
+
+type AccessToken struct {
+	Digest, JTI, User, Client, Audience, Scope, JKT string
+	Expires                                         time.Time
 }
 
 type Store interface {
+	SaveAccess(context.Context, string, AccessToken) error
+	LookupAccess(context.Context, string, string) (AccessToken, error)
+	RevokeToken(context.Context, string, string, string) error
+	AccessRevoked(context.Context, string, string) (bool, error)
 	SavePushedRequest(context.Context, string, string, PushedRequest) error
 	TakePushedRequest(context.Context, string, string, string) (string, error)
 	Consent(context.Context, string, string, Credential) error

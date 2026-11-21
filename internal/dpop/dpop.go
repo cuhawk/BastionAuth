@@ -15,6 +15,10 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 )
 
+func SigningAlgorithms() []jose.SignatureAlgorithm {
+	return append([]jose.SignatureAlgorithm(nil), joseutil.Algorithms...)
+}
+
 var ErrProof = errors.New("invalid DPoP proof")
 
 const Window = 60 * time.Second

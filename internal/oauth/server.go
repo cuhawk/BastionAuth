@@ -34,7 +34,9 @@ type Client struct {
 
 type Server struct {
 	Tenant, Origin, Audience string
+	Resource                 string
 	Clients                  map[string]Client
+	ResourceServers          map[string][]string
 	CIMD                     *CIMDResolver
 	CIMDScopes               []string
 	Store                    store.Store
@@ -50,10 +52,15 @@ func (s Server) Handler() http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.metadata)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.resourceMetadata)
+	registerMetadataPath(mux, "/.well-known/oauth-authorization-server", s.Exchange.Issuer.Name, true, s.metadata)
+	registerMetadataPath(mux, "/.well-known/oauth-protected-resource", s.resourceIdentifier(), false, s.resourceMetadata)
 	mux.HandleFunc("GET /oauth/authorize", s.authorize)
 	mux.HandleFunc("POST /oauth/authorize", s.authorize)
 	mux.HandleFunc("POST /oauth/par", s.pushAuthorization)
 	mux.HandleFunc("POST /oauth/token", s.token)
+	mux.HandleFunc("POST /oauth/revoke", s.revokeToken)
+	mux.HandleFunc("POST /oauth/introspect", s.introspect)
 	mux.HandleFunc("POST /oauth/grant/revoke", s.revoke)
 	handler := instrument(mux)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,21 +74,29 @@ func (s Server) Handler() http.Handler {
 
 func (s Server) metadata(w http.ResponseWriter, _ *http.Request) {
 	respond(w, http.StatusOK, map[string]any{
-		"issuer":                                           s.Exchange.Issuer.Name,
-		"authorization_endpoint":                           s.Origin + "/oauth/authorize",
-		"token_endpoint":                                   s.Origin + "/oauth/token",
-		"jwks_uri":                                         s.Origin + "/.well-known/jwks.json",
-		"pushed_authorization_request_endpoint":            s.Origin + "/oauth/par",
-		"client_id_metadata_document_supported":            s.CIMD != nil,
-		"response_types_supported":                         []string{"code"},
-		"grant_types_supported":                            []string{"authorization_code", "refresh_token", exchange.GrantType},
-		"code_challenge_methods_supported":                 []string{"S256"},
-		"token_endpoint_auth_methods_supported":            []string{"none", "client_secret_basic", "private_key_jwt"},
-		"request_parameter_supported":                      true,
-		"request_uri_parameter_supported":                  true,
-		"require_request_uri_registration":                 true,
-		"request_object_signing_alg_values_supported":      signedAlgorithms,
-		"token_endpoint_auth_signing_alg_values_supported": signedAlgorithms,
+		"issuer":                 s.Exchange.Issuer.Name,
+		"authorization_endpoint": s.Origin + "/oauth/authorize",
+		"revocation_endpoint":    s.Origin + "/oauth/revoke",
+		"revocation_endpoint_auth_methods_supported":               confidentialAuthMethods,
+		"revocation_endpoint_auth_signing_alg_values_supported":    signedAlgorithms,
+		"introspection_endpoint":                                   s.Origin + "/oauth/introspect",
+		"introspection_endpoint_auth_methods_supported":            confidentialAuthMethods,
+		"introspection_endpoint_auth_signing_alg_values_supported": signedAlgorithms,
+		"dpop_signing_alg_values_supported":                        dpop.SigningAlgorithms(),
+		"token_endpoint":                                           s.Origin + "/oauth/token",
+		"jwks_uri":                                                 s.Origin + "/.well-known/jwks.json",
+		"pushed_authorization_request_endpoint":                    s.Origin + "/oauth/par",
+		"client_id_metadata_document_supported":                    s.CIMD != nil,
+		"response_modes_supported":                                 []string{"query"},
+		"response_types_supported":                                 []string{"code"},
+		"grant_types_supported":                                    []string{"authorization_code", "refresh_token", exchange.GrantType},
+		"code_challenge_methods_supported":                         []string{"S256"},
+		"token_endpoint_auth_methods_supported":                    []string{"none", "client_secret_basic", "private_key_jwt"},
+		"request_parameter_supported":                              true,
+		"request_uri_parameter_supported":                          true,
+		"require_request_uri_registration":                         true,
+		"request_object_signing_alg_values_supported":              signedAlgorithms,
+		"token_endpoint_auth_signing_alg_values_supported":         signedAlgorithms,
 	})
 }
 
@@ -162,7 +177,7 @@ func validateAuthorization(p url.Values, client Client) ([]string, exchange.Deta
 		(p.Get("dpop_jkt") != "" && !validDigest(p.Get("dpop_jkt"))) {
 		return nil, nil, "invalid_request"
 	}
-	if !slices.Contains(client.Redirects, p.Get("redirect_uri")) {
+	if !metadataRedirect(p.Get("redirect_uri")) || !slices.Contains(client.Redirects, p.Get("redirect_uri")) {
 		return nil, nil, "invalid_request"
 	}
 	var details exchange.Details
@@ -186,7 +201,7 @@ func validateAuthorization(p url.Values, client Client) ([]string, exchange.Deta
 
 func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 	p, ok := parameters(w, r)
-	if !ok {
+	if !ok || r.URL.Fragment != "" {
 		failure(w, 400, "invalid_request")
 		return
 	}
@@ -306,7 +321,7 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "invalid_request")
 		return
 	}
-	q := redirect.Query()
+	q := url.Values{}
 	q.Set("state", p.Get("state"))
 	if p.Get("decision") == "deny" {
 		q.Set("error", "access_denied")
@@ -319,7 +334,10 @@ func (s Server) authorize(w http.ResponseWriter, r *http.Request) {
 		}
 		q.Set("code", code)
 	}
-	redirect.RawQuery = q.Encode()
+	if redirect.RawQuery != "" {
+		redirect.RawQuery += "&"
+	}
+	redirect.RawQuery += q.Encode()
 	http.Redirect(w, r, redirect.String(), http.StatusSeeOther)
 }
 
@@ -460,7 +478,11 @@ func (s Server) token(w http.ResponseWriter, r *http.Request) {
 				return c, err
 			}
 		}
-		access, err = s.Exchange.Issuer.MintWithDetails(s.Tenant, c.User, s.Audience, c.Scope, jkt, nil, time.Now().Add(lifetime), details)
+		expiry := time.Now().Add(lifetime).Truncate(time.Second)
+		var jti string
+		access, jti, err = s.Exchange.Issuer.MintForClient(s.Tenant, c.User, client, s.Audience, c.Scope, jkt, nil, expiry, details)
+		c.Access = &store.AccessToken{Digest: store.Digest(access), JTI: jti, User: c.User, Client: client,
+			Audience: s.Audience, Scope: c.Scope, JKT: jkt, Expires: expiry}
 		return c, err
 	})
 	switch {
@@ -494,12 +516,18 @@ func (s Server) exchange(w http.ResponseWriter, r *http.Request, p url.Values, c
 		}
 	}
 	result, err := s.Exchange.ExchangeWithDetails(r.Context(), s.Tenant, client, p.Get("subject_token"), p.Get("actor_token"), p.Get("audience"), p.Get("scope"), jkt, details)
+	if err == nil {
+		err = s.Store.SaveAccess(r.Context(), s.Tenant, store.AccessToken{
+			Digest: store.Digest(result.AccessToken), JTI: result.JTI, User: result.Subject, Client: client,
+			Audience: p.Get("audience"), Scope: result.Scope, JKT: jkt, Expires: result.ExpiresAt,
+		})
+	}
 	switch {
 	case errors.Is(err, exchange.ErrScope):
 		failure(w, 400, "invalid_scope")
 	case errors.Is(err, exchange.ErrDetails):
 		failure(w, 400, exchange.ErrDetails.Error())
-	case errors.Is(err, exchange.ErrDenied):
+	case errors.Is(err, exchange.ErrDenied), errors.Is(err, store.ErrInvalid):
 		failure(w, 400, "access_denied")
 	case err != nil:
 		failure(w, 500, "server_error")

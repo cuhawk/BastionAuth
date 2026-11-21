@@ -123,12 +123,30 @@ func metadataURL(raw string) bool {
 }
 
 func metadataRedirect(raw string) bool {
+	return ValidRedirectURI(raw, true)
+}
+
+// ValidRedirectURI validates OAuth callback syntax and rejects reserved query parameters.
+func ValidRedirectURI(raw string, allowLoopback bool) bool {
 	u, err := url.Parse(raw)
 	if err != nil || u.Hostname() == "" || u.User != nil || strings.ContainsAny(u.Hostname(), "*%") || strings.ContainsAny(raw, "#\\") {
 		return false
 	}
 	query, err := url.ParseQuery(u.RawQuery)
-	if err != nil || query.Has("code") || query.Has("error") || query.Has("state") {
+	if err != nil {
+		return false
+	}
+	for _, key := range authorizationFields {
+		if query.Has(key) {
+			return false
+		}
+	}
+	for _, key := range []string{"code", "error", "error_description", "error_uri", "iss", "request", "request_uri", "resource", "response_mode"} {
+		if query.Has(key) {
+			return false
+		}
+	}
+	if !allowLoopback && u.Scheme != "https" {
 		return false
 	}
 	if u.Scheme == "https" {

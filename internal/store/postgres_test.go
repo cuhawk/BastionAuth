@@ -144,9 +144,49 @@ func TestPostgresRLSAndRevocation(t *testing.T) {
 		t.Fatal("RLS accepted cross-tenant insert")
 	}
 	var forced int
-	if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace AND relrowsecurity AND relforcerowsecurity", namespace).Scan(&forced); err != nil || forced != 4 {
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace=$1::regnamespace AND relrowsecurity AND relforcerowsecurity", namespace).Scan(&forced); err != nil || forced != 5 {
 		t.Fatalf("forced RLS tables: %d %v", forced, err)
 	}
+
+	t.Run("token lifecycle", func(t *testing.T) {
+		cred := store.Credential{User: "wave6", Client: "client", Kind: "refresh_token", Expires: time.Now().Add(time.Hour)}
+		token := store.AccessToken{Digest: "wave6-access", JTI: "wave6-jti", User: cred.User, Client: cred.Client, Audience: "inventory", JKT: "thumbprint", Expires: cred.Expires}
+		if err := p.Consent(ctx, "alpha", "wave6-refresh", cred); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.Rotate(ctx, "alpha", "wave6-refresh", "wave6-new-refresh", func(c store.Credential) (store.Credential, error) {
+			c.Access = &token
+			return c, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.RevokeToken(ctx, "beta", cred.Client, "wave6-refresh"); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.RevokeToken(ctx, "alpha", "other-client", token.Digest); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := p.LookupAccess(ctx, "alpha", token.Digest); err != nil || got.JTI != token.JTI || got.JKT != token.JKT {
+			t.Fatalf("active access token: %v %v", got, err)
+		}
+		if err := p.RevokeToken(ctx, "alpha", cred.Client, "wave6-refresh"); err != nil {
+			t.Fatal(err)
+		}
+		if revoked, err := p.AccessRevoked(ctx, "alpha", token.JTI); err != nil || !revoked {
+			t.Fatalf("JTI denylist: %v %v", revoked, err)
+		}
+		if revoked, err := p.AccessRevoked(ctx, "beta", token.JTI); err != nil || revoked {
+			t.Fatalf("JTI leaked across tenants: %v %v", revoked, err)
+		}
+		if _, err := p.LookupAccess(ctx, "alpha", token.Digest); !errors.Is(err, store.ErrInvalid) {
+			t.Fatalf("revoked access token lookup: %v", err)
+		}
+		if err := p.Rotate(ctx, "alpha", "wave6-new-refresh", "wave6-invalid", func(c store.Credential) (store.Credential, error) {
+			return c, nil
+		}); !errors.Is(err, store.ErrInvalid) {
+			t.Fatalf("refresh rotation after revocation: %v", err)
+		}
+	})
 
 	for range 30 {
 		old, pending, refresh := store.Secret(), store.Secret(), store.Secret()
